@@ -14,7 +14,7 @@ The standard testing package doesn't offer a good way to package setup functions
 
 ### Setting up shared setup and running on child tests
 
-Import the library (recommend dot import to make things more succint).
+Import the library (recommend dot import to make things more succinct).
 ```go
 import (
     // ...
