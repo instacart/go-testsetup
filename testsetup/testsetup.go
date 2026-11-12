@@ -125,9 +125,10 @@ func RunSetup(t *testing.T) {
 		mu.Unlock()
 	})
 	t.Cleanup(func() {
-		// Stop new constructions, then wait for any constructor that already
-		// started. Do not hold mu while waiting: in-flight constructors may
-		// still be registering or unwinding.
+		// Stop new evaluations, then wait for any evaluation that already
+		// started, including callers blocked on constructMu. Do not hold mu
+		// while waiting: in-flight evaluations may still be registering or
+		// unwinding.
 		mu.Lock()
 		constructionAllowed.Store(false)
 		mu.Unlock()
@@ -156,26 +157,37 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 	return l
 }
 
-// beginLetConstruction validates the active RunSetup context, records the
-// reset for lifecycle cleanup, counts the construction as in flight, and runs
-// install while still holding the lifecycle lock. Cleanup takes the same lock
-// to disallow new constructions and collect letResets, so construction either
-// starts before cleanup (and is waited for) or returns false here.
-func beginLetConstruction(expectedCtx *testContext, reset func(), install func()) bool {
+// beginLetEvaluation validates the active RunSetup context and counts the
+// evaluation as in flight. It is called before constructMu so callers waiting
+// for another constructor are included in lifecycle draining. Cleanup takes
+// the same mu lock to disallow new evaluations and waits for them before reset.
+func beginLetEvaluation(expectedCtx *testContext) bool {
 	mu.Lock()
 	defer mu.Unlock()
 	if !constructionAllowed.Load() || currentCtx.Load() != expectedCtx {
 		return false
 	}
-	letResets = append(letResets, reset)
 	constructionWG.Add(1)
-	install()
 	return true
 }
 
-// endLetConstruction marks a beginLetConstruction as finished.
-func endLetConstruction() {
+// endLetEvaluation marks a beginLetEvaluation as finished.
+func endLetEvaluation() {
 	constructionWG.Done()
+}
+
+// registerLetReset records the reset and installs the building state for an
+// evaluation that has already begun. It runs under mu so cleanup cannot collect
+// the reset or reset the state between registration and installation.
+func registerLetReset(expectedCtx *testContext, reset func(), install func()) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if currentCtx.Load() != expectedCtx {
+		return false
+	}
+	letResets = append(letResets, reset)
+	install()
+	return true
 }
 
 // ensureBeforeRunSetup fails the test when RunSetup has already started.
@@ -314,9 +326,18 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 	})
 }
 
-// construct builds the value for state. constructMu serializes constructors;
-// after acquiring it we reload and re-check the state.
+// construct builds the value for state. The evaluation is counted before
+// constructMu so callers waiting for another constructor are drained by
+// cleanup too. constructMu serializes constructors; after acquiring it we
+// reload and re-check the state.
 func (m *letMetadata[A]) construct(t *testing.T, ctx *testContext, state *letState[A]) A {
+	if !beginLetEvaluation(ctx) {
+		errorfFuncHook.Apply(t.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
+		var zero A
+		return zero
+	}
+	defer endLetEvaluation()
+
 	m.constructMu.Lock()
 	defer m.constructMu.Unlock()
 
@@ -339,7 +360,7 @@ func (m *letMetadata[A]) construct(t *testing.T, ctx *testContext, state *letSta
 		return state.value
 	case letStatusInitial:
 		var building *letState[A]
-		if !beginLetConstruction(ctx, reset, func() {
+		if !registerLetReset(ctx, reset, func() {
 			building = &letState[A]{ctx: ctx, status: letStatusBuilding}
 			m.state.Store(building)
 		}) {
@@ -347,7 +368,6 @@ func (m *letMetadata[A]) construct(t *testing.T, ctx *testContext, state *letSta
 			var zero A
 			return zero
 		}
-		defer endLetConstruction()
 		state = building
 	case letStatusBuilding:
 		// constructMu serializes constructors: another constructor cannot still be

@@ -379,7 +379,7 @@ func TestTestSetup(t *testing.T) {
 			constructionAllowed.Store(false)
 			t.Cleanup(func() { constructionAllowed.Store(previous) })
 
-			assert.False(t, beginLetConstruction(&testContext{t: t}, func() {}, func() {}))
+			assert.False(t, beginLetEvaluation(&testContext{t: t}))
 		})
 
 		t.Run("BeginConstructionWithStaleContextReturnsFalse", func(t *testing.T) {
@@ -393,7 +393,7 @@ func TestTestSetup(t *testing.T) {
 				constructionAllowed.Store(previousAllowed)
 			})
 
-			assert.False(t, beginLetConstruction(expected, func() {}, func() {}))
+			assert.False(t, beginLetEvaluation(expected))
 		})
 
 		t.Run("MetadataWhenPassingUnexpectedValue", func(t *testing.T) {
