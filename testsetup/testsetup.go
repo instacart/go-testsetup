@@ -112,22 +112,12 @@ func RunSetup(t *testing.T) {
 	funcs := append([]func(*testing.T){}, setupFuncs...)
 	mu.Unlock()
 
-	// Register this before any setup callback. LIFO cleanup ordering then runs
-	// it after teardown callbacks registered by setup or by the test body, so
-	// teardowns still see the cached values. The context is cleared here, so
-	// Lets cannot be used after this cleanup starts.
+	// Register these before any setup callback. LIFO cleanup ordering makes the
+	// wait run first and the final reset run last, after teardowns registered by
+	// setup, the test body, or an in-flight constructor.
 	t.Cleanup(func() {
-		// Stop new constructions, then wait for any constructor that already
-		// started. Do not hold mu while waiting: in-flight constructors may
-		// still be registering or unwinding.
-		mu.Lock()
-		constructionAllowed.Store(false)
-		mu.Unlock()
-		constructionWG.Wait()
-
-		// No constructor is running and none can start. Invalidate cached
-		// values before clearing the lifecycle so a concurrent reader cannot
-		// observe an old built state after the context is gone.
+		// Final reset. Registered first so it runs after the wait cleanup and
+		// any teardowns registered while that wait is in progress.
 		mu.Lock()
 		resets := letResets
 		letResets = nil
@@ -137,6 +127,15 @@ func RunSetup(t *testing.T) {
 		generation.Add(1)
 		currentCtx.Store(nil)
 		mu.Unlock()
+	})
+	t.Cleanup(func() {
+		// Stop new constructions, then wait for any constructor that already
+		// started. Do not hold mu while waiting: in-flight constructors may
+		// still be registering or unwinding.
+		mu.Lock()
+		constructionAllowed.Store(false)
+		mu.Unlock()
+		constructionWG.Wait()
 	})
 
 	// Run callbacks without holding mu: they may call public helpers that
@@ -296,7 +295,7 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 		}
 
 		ctx := currentCtx.Load()
-		if ctx == nil || ctx.t == nil || !constructionAllowed.Load() {
+		if ctx == nil || ctx.t == nil {
 			definitionT.Helper()
 			// Note: we cannot call FatalIfError because definitionT
 			// is likely a parent test and we may be within a subtest.
@@ -401,14 +400,14 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 // by calling the provider constructor.
 //
 // A Let can only be evaluated while RunSetup is active. Calls before RunSetup
-// or once cleanup has begun fail the test with the same "Must call RunSetup"
+// or after the final cleanup fail the test with the same "Must call RunSetup"
 // error as a call before RunSetup.
 //
 // RunSetup cleanup stops new constructions and waits for constructions already
-// in flight before resetting cached values. Evaluations that observe cleanup in
-// progress fail the test; a cached read that already began before cleanup may
-// still complete. Concurrent evaluation is supported. Recursive construction
-// (a Let whose constructor evaluates itself) deadlocks.
+// in flight before the final reset. Cached reads may complete while cleanup
+// waits; starting construction after cleanup begins fails. Concurrent
+// evaluation is supported. Recursive construction (a Let whose constructor
+// evaluates itself) deadlocks.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{

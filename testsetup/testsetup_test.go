@@ -304,6 +304,30 @@ func TestTestSetup(t *testing.T) {
 			assert.Equal(t, 1, callCount)
 		})
 
+		t.Run("InFlightConstructorTeardownSeesCachedValue", func(t *testing.T) {
+			var seen string
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var a LetWrapper[*Sample]
+			a = Let(t, func(t *testing.T) *Sample {
+				close(started)
+				<-release
+				t.Cleanup(func() { seen = a().value })
+				return &Sample{value: "constructed"}
+			})
+
+			t.Run("Run", func(t *testing.T) {
+				RunSetup(t)
+				go func() { _ = a() }()
+				<-started
+				// Runs before the RunSetup wait cleanup, unblocking the
+				// constructor so it can register its own teardown.
+				t.Cleanup(func() { close(release) })
+			})
+
+			assert.Equal(t, "constructed", seen)
+		})
+
 		t.Run("AfterRunSetupCleanupFails", func(t *testing.T) {
 			a := LetValue(t, 1)
 			errorMsgs := []string{}

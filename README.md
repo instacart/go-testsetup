@@ -92,15 +92,15 @@ Call `ModifyLet` (or `ModifyLetValue`) before `RunSetup` for the current test. O
 starts, values may already be built, so calling either from a setup function or after
 `RunSetup` fails the test instead of leaving a stale cached value.
 
-A `Let` can only be evaluated while `RunSetup` is active. Calls before `RunSetup` or once
-cleanup has begun fail the test with the same “Must call RunSetup” error. Teardowns
-registered by setup functions or the test body still see the cached value; the cache is
-reset after those teardowns run.
+A `Let` can only be evaluated while `RunSetup` is active. Calls before `RunSetup` or after
+the final cleanup fail the test with the same “Must call RunSetup” error. Teardowns
+registered by setup functions, the test body, or an in-flight constructor still see the
+cached value; the cache is reset after those teardowns run.
 
 Concurrent evaluation is supported. `RunSetup` cleanup stops new constructions and waits
-for constructions already in flight before resetting cached values. Evaluations that
-observe cleanup in progress fail the test; a cached read that already began before cleanup
-may still complete. A `Let` whose constructor evaluates itself recursively deadlocks.
+for constructions already in flight before the final reset. Cached reads may complete while
+cleanup waits; starting construction after cleanup begins fails. A `Let` whose constructor
+evaluates itself recursively deadlocks.
 
 Example from [example/example2_test.go](example/example2_test.go):
 
