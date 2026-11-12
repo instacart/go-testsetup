@@ -96,6 +96,9 @@ A `Let` can only be evaluated while `RunSetup` is active. Calls before `RunSetup
 its cleanup fail the test. Teardowns registered by setup functions or the test body still
 see the cached value; the cache is reset after those teardowns run.
 
+Construction must happen on the goroutine that called `RunSetup`. Evaluate a `Let` before
+starting worker goroutines; concurrent construction is unsupported and fails the test.
+
 Example from [example/example2_test.go](example/example2_test.go):
 
 ```go

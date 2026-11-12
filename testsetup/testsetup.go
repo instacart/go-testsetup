@@ -267,7 +267,10 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			} else if status == letStatusFailed {
 				FatalIfError(t, fmt.Errorf("Let failed to build"))
 			} else if status == letStatusBuilding {
-				FatalIfError(t, fmt.Errorf("Failed to build Let, possible cycle!"))
+				// Recursive construction and concurrent evaluation cannot be
+				// distinguished without goroutine identity. Both are unsupported;
+				// fail instead of waiting (which would deadlock on a cycle).
+				FatalIfError(t, fmt.Errorf("Failed to build Let, possible cycle! Concurrent evaluation from multiple goroutines is also unsupported."))
 			} else if status == letStatusInitial {
 				if m.status.CompareAndSwap(letStatusInitial, letStatusBuilding) {
 					// Register the reset with the RunSetup lifecycle instead of
@@ -300,6 +303,10 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 //
 // A Let can only be evaluated after RunSetup starts and before the RunSetup
 // lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
+//
+// Construction must happen on the goroutine that called RunSetup. Evaluate a
+// Let before starting worker goroutines; concurrent construction is unsupported
+// and fails the test.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{
