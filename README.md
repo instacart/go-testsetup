@@ -88,6 +88,10 @@ PASS
 Similar to RSpec, you can define lazily computed values using `Let(t, func(t *testing.T) SomeType {...})`.
 Those can be modified in child tests.
 
+Call `ModifyLet` (or `ModifyLetValue`) before `RunSetup` for the current test. Once setup
+starts, values may already be built, so calling either from a setup function or after
+`RunSetup` fails the test instead of leaving a stale cached value.
+
 Example from [example/example2_test.go](example/example2_test.go):
 
 ```go

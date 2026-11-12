@@ -82,20 +82,29 @@ func AddSetup(t *testing.T, f func(t *testing.T)) {
 }
 
 // RunSetup runs setup functions added by `testsetup.AddSetup`.
+//
+// Setup callbacks must not call ModifyLet or ModifyLetValue; those helpers must
+// run before setup starts.
 func RunSetup(t *testing.T) {
 	t.Helper()
 	mu.Lock()
-	defer mu.Unlock()
 	if currentT != nil {
+		mu.Unlock()
 		FatalIfError(t, fmt.Errorf("RunSetup called twice or using parallel tests which is unsupported"))
 	}
 	currentT = t
+	funcs := append([]func(*testing.T){}, setupFuncs...)
+	mu.Unlock()
+
 	t.Cleanup(func() {
 		mu.Lock()
 		defer mu.Unlock()
 		currentT = nil
 	})
-	for _, f := range setupFuncs {
+
+	// Run callbacks without holding mu: they may call public helpers that
+	// need it themselves.
+	for _, f := range funcs {
 		f(t)
 	}
 }
@@ -115,10 +124,42 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 	return l
 }
 
+// ensureBeforeRunSetup fails the test when RunSetup has already started.
+func ensureBeforeRunSetup(t *testing.T, name string) {
+	t.Helper()
+	mu.Lock()
+	started := currentT != nil
+	mu.Unlock()
+	if started {
+		FatalIfError(t, fmt.Errorf("%s must be called before RunSetup", name))
+	}
+}
+
 // ModifyLet modifies the value of the LetWrapper for the current test.
 //
 // It receives a function that can access the previous constructor through the `super` function.
+//
+// It must be called before RunSetup. Once setup starts, Let values may already
+// be built, so calling ModifyLet (including from a setup function) fails the
+// test instead of silently keeping a stale cached value.
 func ModifyLet[A any](t *testing.T, l LetWrapper[A], f func(t *testing.T, super func() A) A) {
+	t.Helper()
+	ensureBeforeRunSetup(t, "ModifyLet")
+	modifyLet(t, l, f)
+}
+
+// ModifyLetValue is a variant of ModifyLet that uses a constant value.
+//
+// It must be called before RunSetup; see ModifyLet.
+func ModifyLetValue[A immutable](t *testing.T, l LetWrapper[A], a A) {
+	t.Helper()
+	ensureBeforeRunSetup(t, "ModifyLetValue")
+	modifyLet(t, l, func(t *testing.T, super func() A) A {
+		return a
+	})
+}
+
+func modifyLet[A any](t *testing.T, l LetWrapper[A], f func(t *testing.T, super func() A) A) {
 	t.Helper()
 	m := l.metadata(t)
 	previousConstructor := m.constructor
@@ -128,14 +169,6 @@ func ModifyLet[A any](t *testing.T, l LetWrapper[A], f func(t *testing.T, super 
 	m.constructor = func(t *testing.T) A {
 		return f(t, func() A { return previousConstructor(t) })
 	}
-}
-
-// ModifyLetValue is a variant of ModifyLet that uses a constant value.
-func ModifyLetValue[A immutable](t *testing.T, l LetWrapper[A], a A) {
-	t.Helper()
-	ModifyLet(t, l, func(t *testing.T, super func() A) A {
-		return a
-	})
 }
 
 // metadata returns the letMetadata for the LetWrapper.
@@ -175,13 +208,6 @@ type letMetadata[A any] struct {
 // createWrapper creates a LetWrapper from the metadata.
 func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 	definitionT.Helper()
-	AddSetup(definitionT, func(t *testing.T) {
-		t.Cleanup(func() {
-			m.status.Store(letStatusInitial)
-			var zeroValue A
-			m.value = zeroValue
-		})
-	})
 	return LetWrapper[A](func() (res A) {
 		if setMetadataPointer.Load() {
 			*(tmpMetadataPointer.(**letMetadata[A])) = m
@@ -212,6 +238,15 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 				FatalIfError(t, fmt.Errorf("Failed to build Let, possible cycle!"))
 			} else if status == letStatusInitial {
 				if m.status.CompareAndSwap(letStatusInitial, letStatusBuilding) {
+					// Register cleanup as soon as the value is built. Doing it here,
+					// rather than from an AddSetup callback, means a Let built by an
+					// earlier setup callback is still reset if that callback skips or
+					// fails before reaching this Let's setup callback.
+					t.Cleanup(func() {
+						m.status.Store(letStatusInitial)
+						var zeroValue A
+						m.value = zeroValue
+					})
 					defer func() {
 						// Try setting status to failure
 						m.status.CompareAndSwap(letStatusBuilding, letStatusFailed)

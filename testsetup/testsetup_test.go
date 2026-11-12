@@ -212,6 +212,53 @@ func TestTestSetup(t *testing.T) {
 			})
 		})
 
+		t.Run("ModifyAfterRunSetupFails", func(t *testing.T) {
+			a := LetValue(t, 1)
+			RunSetup(t)
+
+			AssertFatalContains(t, func() {
+				ModifyLet(t, a, func(t *testing.T, super func() int) int { return 2 })
+			}, "ModifyLet must be called before RunSetup")
+
+			AssertFatalContains(t, func() {
+				ModifyLetValue(t, a, 2)
+			}, "ModifyLetValue must be called before RunSetup")
+		})
+
+		t.Run("ModifyInSetupFails", func(t *testing.T) {
+			a := LetValue(t, 1)
+
+			AssertFatalContains(t, func() {
+				AddSetup(t, func(t *testing.T) {
+					ModifyLet(t, a, func(t *testing.T, super func() int) int { return 2 })
+				})
+				RunSetup(t)
+			}, "ModifyLet must be called before RunSetup")
+		})
+
+		t.Run("ResetWhenSetupSkipsAfterBuild", func(t *testing.T) {
+			callCount := 0
+			var a LetWrapper[int]
+
+			t.Run("BuildThenSkip", func(t *testing.T) {
+				AddSetup(t, func(t *testing.T) {
+					assert.Equal(t, 1, a())
+					t.SkipNow()
+				})
+				a = Let(t, func(t *testing.T) int {
+					callCount++
+					return callCount
+				})
+				RunSetup(t)
+			})
+
+			t.Run("AfterSkip", func(t *testing.T) {
+				RunSetup(t)
+				assert.Equal(t, 2, a())
+				assert.Equal(t, 2, callCount)
+			})
+		})
+
 		t.Run("WhenAccessedBeforeRun", func(t *testing.T) {
 			a := LetValue(t, 1)
 
