@@ -356,13 +356,13 @@ func TestTestSetup(t *testing.T) {
 			assert.NotPanics(t, func() { m.loadState(123) })
 		})
 
-		t.Run("RegisterResetAfterTestEndPanics", func(t *testing.T) {
+		t.Run("BeginConstructionAfterTestEndPanics", func(t *testing.T) {
 			previous := currentCtx.Load()
 			currentCtx.Store(&testContext{t: t, generation: 2})
 			t.Cleanup(func() { currentCtx.Store(previous) })
 
 			assert.Panics(t, func() {
-				registerLetReset(1, func() {}, func() {})
+				beginLetConstruction(1, func() {}, func() {})
 			})
 		})
 

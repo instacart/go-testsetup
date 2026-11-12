@@ -22,6 +22,8 @@ var (
 	tmpMetadataPointer any
 	currentCtx         atomic.Pointer[testContext]
 	generation         atomic.Uint64
+	constructionWG     sync.WaitGroup
+	constructionClosed bool // guarded by mu
 	setupFuncs         []func(t *testing.T)
 	letResets          []func()
 )
@@ -105,6 +107,7 @@ func RunSetup(t *testing.T) {
 	}
 	generation.Add(1)
 	currentCtx.Store(&testContext{t: t, generation: generation.Load()})
+	constructionClosed = false
 	letResets = nil
 	funcs := append([]func(*testing.T){}, setupFuncs...)
 	mu.Unlock()
@@ -114,16 +117,26 @@ func RunSetup(t *testing.T) {
 	// teardowns still see the cached values. The context is cleared here, so
 	// Lets cannot be used after this cleanup starts.
 	t.Cleanup(func() {
+		// Stop new constructions, then wait for any constructor that already
+		// started. Constructors publish under mu, so do not hold mu while
+		// waiting.
+		mu.Lock()
+		constructionClosed = true
+		mu.Unlock()
+		constructionWG.Wait()
+
+		// No constructor is running and none can start. Invalidate cached
+		// values before clearing the lifecycle so a concurrent reader cannot
+		// observe an old built state after the context is gone.
 		mu.Lock()
 		resets := letResets
 		letResets = nil
-		generation.Add(1)
-		currentCtx.Store(nil)
-		mu.Unlock()
-
 		for i := len(resets) - 1; i >= 0; i-- {
 			resets[i]()
 		}
+		generation.Add(1)
+		currentCtx.Store(nil)
+		mu.Unlock()
 	})
 
 	// Run callbacks without holding mu: they may call public helpers that
@@ -148,19 +161,26 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 	return l
 }
 
-// registerLetReset validates the active RunSetup generation, records reset for
-// the lifecycle cleanup, and runs install while still holding the lifecycle
-// lock. Cleanup takes the same lock when it collects letResets and clears
-// currentCtx, so registration cannot miss a cleanup that is already in flight.
-//
-// The lifecycle cleanup runs the resets after teardown callbacks registered by
-// setup or the test body.
-func registerLetReset(expectedGeneration uint64, reset func(), install func()) {
+// beginLetConstruction validates the active RunSetup generation, records the
+// reset for lifecycle cleanup, counts the construction as in flight, and runs
+// install while still holding the lifecycle lock. Cleanup takes the same lock
+// to close construction and collect letResets, so construction either starts
+// before cleanup (and is waited for) or panics here.
+func beginLetConstruction(expectedGeneration uint64, reset func(), install func()) {
 	mu.Lock()
 	defer mu.Unlock()
+	if constructionClosed {
+		panic("testsetup: the test ended before Let construction started")
+	}
 	validateGenerationLocked(expectedGeneration)
 	letResets = append(letResets, reset)
+	constructionWG.Add(1)
 	install()
+}
+
+// endLetConstruction marks a beginLetConstruction as finished.
+func endLetConstruction() {
+	constructionWG.Done()
 }
 
 // validateGenerationLocked panics unless the active RunSetup context still
@@ -261,7 +281,7 @@ type letMetadata[A any] struct {
 	// definitionT *testing.T
 	constructor func(t *testing.T) A
 	state       atomic.Pointer[letState[A]]
-	buildMu     sync.Mutex
+	constructMu sync.Mutex
 }
 
 // createWrapper creates a LetWrapper from the metadata.
@@ -321,11 +341,11 @@ func (m *letMetadata[A]) loadState(expectedGeneration uint64) *letState[A] {
 	return state
 }
 
-// construct builds the value for state. buildMu serializes constructors; after
+// construct builds the value for state. constructMu serializes constructors; after
 // acquiring it we reload and re-check both the generation and the state.
 func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, state *letState[A]) A {
-	m.buildMu.Lock()
-	defer m.buildMu.Unlock()
+	m.constructMu.Lock()
+	defer m.constructMu.Unlock()
 
 	reset := func() {
 		m.state.Store(&letState[A]{status: letStatusInitial})
@@ -340,13 +360,14 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 		return state.value
 	case letStatusInitial:
 		var building *letState[A]
-		registerLetReset(expectedGeneration, reset, func() {
+		beginLetConstruction(expectedGeneration, reset, func() {
 			building = &letState[A]{generation: expectedGeneration, status: letStatusBuilding}
 			m.state.Store(building)
 		})
+		defer endLetConstruction()
 		state = building
 	case letStatusBuilding:
-		// buildMu serializes constructors: another constructor cannot still be
+		// constructMu serializes constructors: another constructor cannot still be
 		// building while we hold it. Seeing this state means an invariant was
 		// broken, not that we should build on another constructor's behalf.
 		panic("testsetup: Let is already building after acquiring the build lock")
@@ -375,8 +396,8 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 // constructor that finishes after the lifecycle ended cannot publish: it panics
 // instead of returning a value from a completed test.
 //
-// Lock ordering is buildMu (held by construct) then mu. Cleanup takes mu but
-// never buildMu, so holding mu here cannot deadlock with cleanup.
+// Lock ordering is constructMu (held by construct) then mu. Cleanup takes mu but
+// never constructMu, so holding mu here cannot deadlock with cleanup.
 func (m *letMetadata[A]) publishBuilt(expectedGeneration uint64, building *letState[A], value A) {
 	mu.Lock()
 	defer mu.Unlock()
