@@ -358,26 +358,20 @@ func TestTestSetup(t *testing.T) {
 			assert.Contains(t, errorMsgs[0], "Must call RunSetup before using Let")
 		})
 
-		t.Run("GenerationMismatchPanics", func(t *testing.T) {
+		t.Run("CachedReadUsesSnapshotWithoutCurrentCtx", func(t *testing.T) {
+			m := &letMetadata[int]{}
+			a := m.createWrapper(t)
+			m.state.Store(&letState[int]{
+				ctx:    &testContext{t: t},
+				status: letStatusBuilt,
+				value:  42,
+			})
+
 			previous := currentCtx.Load()
-			currentCtx.Store(&testContext{t: t, generation: 2})
+			currentCtx.Store(nil)
 			t.Cleanup(func() { currentCtx.Store(previous) })
 
-			m := &letMetadata[int]{}
-			m.state.Store(&letState[int]{generation: 1, status: letStatusBuilt, value: 1})
-
-			assert.Panics(t, func() { m.loadState(2) })
-		})
-
-		t.Run("UninitializedStateAllowed", func(t *testing.T) {
-			previous := currentCtx.Load()
-			currentCtx.Store(&testContext{t: t, generation: 123})
-			t.Cleanup(func() { currentCtx.Store(previous) })
-
-			m := &letMetadata[int]{}
-			m.state.Store(&letState[int]{status: letStatusInitial})
-
-			assert.NotPanics(t, func() { m.loadState(123) })
+			assert.Equal(t, 42, a())
 		})
 
 		t.Run("BeginConstructionWhenDisallowedReturnsFalse", func(t *testing.T) {
@@ -385,22 +379,21 @@ func TestTestSetup(t *testing.T) {
 			constructionAllowed.Store(false)
 			t.Cleanup(func() { constructionAllowed.Store(previous) })
 
-			assert.False(t, beginLetConstruction(1, func() {}, func() {}))
+			assert.False(t, beginLetConstruction(&testContext{t: t}, func() {}, func() {}))
 		})
 
-		t.Run("BeginConstructionGenerationMismatchPanics", func(t *testing.T) {
+		t.Run("BeginConstructionWithStaleContextReturnsFalse", func(t *testing.T) {
 			previousCtx := currentCtx.Load()
 			previousAllowed := constructionAllowed.Load()
-			currentCtx.Store(&testContext{t: t, generation: 2})
+			expected := &testContext{t: t}
+			currentCtx.Store(&testContext{t: t})
 			constructionAllowed.Store(true)
 			t.Cleanup(func() {
 				currentCtx.Store(previousCtx)
 				constructionAllowed.Store(previousAllowed)
 			})
 
-			assert.Panics(t, func() {
-				beginLetConstruction(1, func() {}, func() {})
-			})
+			assert.False(t, beginLetConstruction(expected, func() {}, func() {}))
 		})
 
 		t.Run("MetadataWhenPassingUnexpectedValue", func(t *testing.T) {

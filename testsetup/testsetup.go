@@ -12,8 +12,7 @@ import (
 )
 
 type testContext struct {
-	t          *testing.T
-	generation uint64
+	t *testing.T
 }
 
 var (
@@ -21,7 +20,6 @@ var (
 	setMetadataPointer  atomic.Bool
 	tmpMetadataPointer  any
 	currentCtx          atomic.Pointer[testContext]
-	generation          atomic.Uint64
 	constructionWG      sync.WaitGroup
 	constructionAllowed atomic.Bool // guarded writes; lock-free reads
 	setupFuncs          []func(t *testing.T)
@@ -105,8 +103,7 @@ func RunSetup(t *testing.T) {
 		mu.Unlock()
 		FatalIfError(t, fmt.Errorf("RunSetup called twice or using parallel tests which is unsupported"))
 	}
-	generation.Add(1)
-	currentCtx.Store(&testContext{t: t, generation: generation.Load()})
+	currentCtx.Store(&testContext{t: t})
 	constructionAllowed.Store(true)
 	letResets = nil
 	funcs := append([]func(*testing.T){}, setupFuncs...)
@@ -124,7 +121,6 @@ func RunSetup(t *testing.T) {
 		for i := len(resets) - 1; i >= 0; i-- {
 			resets[i]()
 		}
-		generation.Add(1)
 		currentCtx.Store(nil)
 		mu.Unlock()
 	})
@@ -160,18 +156,17 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 	return l
 }
 
-// beginLetConstruction validates the active RunSetup generation, records the
+// beginLetConstruction validates the active RunSetup context, records the
 // reset for lifecycle cleanup, counts the construction as in flight, and runs
 // install while still holding the lifecycle lock. Cleanup takes the same lock
 // to disallow new constructions and collect letResets, so construction either
-// starts before cleanup (and is waited for) or panics here.
-func beginLetConstruction(expectedGeneration uint64, reset func(), install func()) bool {
+// starts before cleanup (and is waited for) or returns false here.
+func beginLetConstruction(expectedCtx *testContext, reset func(), install func()) bool {
 	mu.Lock()
 	defer mu.Unlock()
-	if !constructionAllowed.Load() {
+	if !constructionAllowed.Load() || currentCtx.Load() != expectedCtx {
 		return false
 	}
-	validateGenerationLocked(expectedGeneration)
 	letResets = append(letResets, reset)
 	constructionWG.Add(1)
 	install()
@@ -181,19 +176,6 @@ func beginLetConstruction(expectedGeneration uint64, reset func(), install func(
 // endLetConstruction marks a beginLetConstruction as finished.
 func endLetConstruction() {
 	constructionWG.Done()
-}
-
-// validateGenerationLocked panics unless the active RunSetup context still
-// carries expectedGeneration. It is the single check that binds a Let
-// operation to the lifecycle it started in.
-//
-// Callers must hold mu: cleanup clears currentCtx and advances the generation
-// while holding it, so a check made under the lock cannot race with cleanup.
-func validateGenerationLocked(expectedGeneration uint64) {
-	ctx := currentCtx.Load()
-	if ctx == nil || ctx.t == nil || ctx.generation != expectedGeneration {
-		panic("testsetup: the test ended before Let construction finished")
-	}
 }
 
 // ensureBeforeRunSetup fails the test when RunSetup has already started.
@@ -271,9 +253,9 @@ const (
 )
 
 type letState[A any] struct {
-	generation uint64
-	status     int32
-	value      A
+	ctx    *testContext
+	status int32
+	value  A
 }
 
 // letMetadata contains the state of a LetWrapper.
@@ -294,6 +276,22 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			return
 		}
 
+		// A cached state is a complete snapshot: no separate lifecycle read is
+		// needed. If it was built for a context that has since ended, this read
+		// linearizes before the reset that replaced it.
+		state := m.state.Load()
+		switch state.status {
+		case letStatusBuilt:
+			return state.value
+		case letStatusFailed:
+			if state.ctx != nil && state.ctx.t != nil {
+				FatalIfError(state.ctx.t, fmt.Errorf("Let failed to build"))
+			} else {
+				errorfFuncHook.Apply(definitionT.Errorf)("ERROR: %v", fmt.Errorf("Let failed to build"))
+			}
+			return state.value
+		}
+
 		ctx := currentCtx.Load()
 		if ctx == nil || ctx.t == nil {
 			definitionT.Helper()
@@ -304,46 +302,21 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			// to random non existing files if you do that. So instead
 			// we just mark the failure and let the subtest continue.
 			//
-			// The context is nil before RunSetup and after the RunSetup
-			// cleanup runs, so both cases are rejected here.
+			// The context is nil before RunSetup and after the final cleanup,
+			// so both cases are rejected here.
 			errorfFuncHook.Apply(definitionT.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
 			return
 		}
 		t := ctx.t
 		t.Helper()
 
-		state := m.loadState(ctx.generation)
-		switch state.status {
-		case letStatusBuilt:
-			return state.value
-		case letStatusFailed:
-			FatalIfError(t, fmt.Errorf("Let failed to build"))
-			return state.value
-		default:
-			return m.construct(t, ctx.generation, state)
-		}
+		return m.construct(t, ctx, state)
 	})
 }
 
-// loadState loads the current state and verifies that it belongs to the
-// expected RunSetup generation. An uninitialized state (generation zero) is
-// allowed; construct stamps it with the active generation.
-func (m *letMetadata[A]) loadState(expectedGeneration uint64) *letState[A] {
-	state := m.state.Load()
-	if state.status == letStatusInitial && state.generation == 0 {
-		// Uninitialized; construct validates the active generation and installs
-		// the building state under the lifecycle lock.
-		return state
-	}
-	if state.generation != expectedGeneration {
-		panic("testsetup: Let state belongs to a different RunSetup generation; the test ended before evaluation finished")
-	}
-	return state
-}
-
-// construct builds the value for state. constructMu serializes constructors; after
-// acquiring it we reload and re-check both the generation and the state.
-func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, state *letState[A]) A {
+// construct builds the value for state. constructMu serializes constructors;
+// after acquiring it we reload and re-check the state.
+func (m *letMetadata[A]) construct(t *testing.T, ctx *testContext, state *letState[A]) A {
 	m.constructMu.Lock()
 	defer m.constructMu.Unlock()
 
@@ -351,17 +324,23 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 		m.state.Store(&letState[A]{status: letStatusInitial})
 	}
 
-	state = m.loadState(expectedGeneration)
+	state = m.state.Load()
 	switch state.status {
 	case letStatusBuilt:
+		if state.ctx != ctx {
+			panic("testsetup: Let state belongs to a different RunSetup context")
+		}
 		return state.value
 	case letStatusFailed:
+		if state.ctx != ctx {
+			panic("testsetup: Let state belongs to a different RunSetup context")
+		}
 		FatalIfError(t, fmt.Errorf("Let failed to build"))
 		return state.value
 	case letStatusInitial:
 		var building *letState[A]
-		if !beginLetConstruction(expectedGeneration, reset, func() {
-			building = &letState[A]{generation: expectedGeneration, status: letStatusBuilding}
+		if !beginLetConstruction(ctx, reset, func() {
+			building = &letState[A]{ctx: ctx, status: letStatusBuilding}
 			m.state.Store(building)
 		}) {
 			errorfFuncHook.Apply(t.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
@@ -382,14 +361,12 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 		if built {
 			return
 		}
-		// If the test ended and cleanup reset the state, this CAS fails and
-		// the reset wins. Otherwise the failed state belongs to this
-		// generation and a later evaluation will detect the generation change.
-		m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusFailed})
+		// If cleanup reset the state, this CAS fails and the reset wins.
+		m.state.CompareAndSwap(state, &letState[A]{ctx: ctx, status: letStatusFailed})
 	}()
 
 	value := m.constructor(t)
-	if !m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
+	if !m.state.CompareAndSwap(state, &letState[A]{ctx: ctx, status: letStatusBuilt, value: value}) {
 		panic("testsetup: Let state changed while constructing")
 	}
 	built = true
