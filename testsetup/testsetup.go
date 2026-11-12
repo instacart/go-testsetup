@@ -258,8 +258,10 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 		}
 		t.Helper()
 
-		status := m.status.Load()
 		for {
+			// Reload on every iteration: another goroutine may have won the
+			// compare-and-swap or finished building while we were waiting.
+			status := m.status.Load()
 			if status == letStatusBuilt {
 				break
 			} else if status == letStatusFailed {
