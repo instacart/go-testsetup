@@ -366,6 +366,31 @@ func TestTestSetup(t *testing.T) {
 			})
 		})
 
+		t.Run("PublishAfterCleanupPanics", func(t *testing.T) {
+			for name, ctx := range map[string]*testContext{
+				"ClearedContext": nil,
+				"NextGeneration": {t: t, generation: 3},
+			} {
+				t.Run(name, func(t *testing.T) {
+					previous := currentCtx.Load()
+					currentCtx.Store(ctx)
+					t.Cleanup(func() { currentCtx.Store(previous) })
+
+					m := &letMetadata[int]{}
+					building := &letState[int]{generation: 2, status: letStatusBuilding}
+					m.state.Store(building)
+
+					assert.PanicsWithValue(t,
+						"testsetup: the test ended before Let construction finished",
+						func() { m.publishBuilt(2, building, 1) },
+					)
+					// The value must not be published for a lifecycle that ended.
+					assert.Same(t, building, m.state.Load())
+					assert.Equal(t, int32(letStatusBuilding), m.state.Load().status)
+				})
+			}
+		})
+
 		t.Run("MetadataWhenPassingUnexpectedValue", func(t *testing.T) {
 			AssertFatalContains(t, func() {
 				LetWrapper[int](func() int { return 1 }).metadata(t)

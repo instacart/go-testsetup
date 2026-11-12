@@ -158,12 +158,22 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 func registerLetReset(expectedGeneration uint64, reset func(), install func()) {
 	mu.Lock()
 	defer mu.Unlock()
+	validateGenerationLocked(expectedGeneration)
+	letResets = append(letResets, reset)
+	install()
+}
+
+// validateGenerationLocked panics unless the active RunSetup context still
+// carries expectedGeneration. It is the single check that binds a Let
+// operation to the lifecycle it started in.
+//
+// Callers must hold mu: cleanup clears currentCtx and advances the generation
+// while holding it, so a check made under the lock cannot race with cleanup.
+func validateGenerationLocked(expectedGeneration uint64) {
 	ctx := currentCtx.Load()
 	if ctx == nil || ctx.t == nil || ctx.generation != expectedGeneration {
 		panic("testsetup: the test ended before Let construction finished")
 	}
-	letResets = append(letResets, reset)
-	install()
 }
 
 // ensureBeforeRunSetup fails the test when RunSetup has already started.
@@ -354,11 +364,26 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 	}()
 
 	value := m.constructor(t)
-	if !m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
-		panic("testsetup: Let was reset while constructing")
-	}
+	m.publishBuilt(expectedGeneration, state, value)
 	built = true
 	return value
+}
+
+// publishBuilt validates the active generation and publishes the constructed
+// value, all while holding mu. Cleanup clears currentCtx and advances the
+// generation under the same lock before it resets individual Let states, so a
+// constructor that finishes after the lifecycle ended cannot publish: it panics
+// instead of returning a value from a completed test.
+//
+// Lock ordering is buildMu (held by construct) then mu. Cleanup takes mu but
+// never buildMu, so holding mu here cannot deadlock with cleanup.
+func (m *letMetadata[A]) publishBuilt(expectedGeneration uint64, building *letState[A], value A) {
+	mu.Lock()
+	defer mu.Unlock()
+	validateGenerationLocked(expectedGeneration)
+	if !m.state.CompareAndSwap(building, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
+		panic("testsetup: Let was reset while constructing")
+	}
 }
 
 // Let creates a LetWrapper that lazily loads the value when requested for
@@ -367,10 +392,10 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 // A Let can only be evaluated after RunSetup starts and before the RunSetup
 // lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
 //
-// Each evaluation is bound to the RunSetup generation it started in. If the
-// test ends before evaluation finishes, evaluation panics. Concurrent
-// evaluation is supported. Recursive construction (a Let whose constructor
-// evaluates itself) deadlocks.
+// Each evaluation must finish before the RunSetup lifecycle cleanup runs: an
+// evaluation that outlives its test panics instead of returning a value, even
+// when its constructor already returned. Concurrent evaluation is supported.
+// Recursive construction (a Let whose constructor evaluates itself) deadlocks.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{
