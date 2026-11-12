@@ -148,13 +148,22 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 	return l
 }
 
-// registerLetReset records a reset for the active RunSetup lifecycle. The
-// lifecycle cleanup runs the resets after teardown callbacks registered by
+// registerLetReset validates the active RunSetup generation, records reset for
+// the lifecycle cleanup, and runs install while still holding the lifecycle
+// lock. Cleanup takes the same lock when it collects letResets and clears
+// currentCtx, so registration cannot miss a cleanup that is already in flight.
+//
+// The lifecycle cleanup runs the resets after teardown callbacks registered by
 // setup or the test body.
-func registerLetReset(reset func()) {
+func registerLetReset(expectedGeneration uint64, reset func(), install func()) {
 	mu.Lock()
 	defer mu.Unlock()
+	ctx := currentCtx.Load()
+	if ctx == nil || ctx.t == nil || ctx.generation != expectedGeneration {
+		panic("testsetup: the test ended before Let construction finished")
+	}
 	letResets = append(letResets, reset)
+	install()
 }
 
 // ensureBeforeRunSetup fails the test when RunSetup has already started.
@@ -292,12 +301,8 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 func (m *letMetadata[A]) loadState(expectedGeneration uint64) *letState[A] {
 	state := m.state.Load()
 	if state.status == letStatusInitial && state.generation == 0 {
-		// An uninitialized state is not tied to a generation yet. Only allow
-		// claiming it while expectedGeneration is the active generation; a swap
-		// that reset it leaves it uninitialized for the next generation.
-		if !m.generationMatches(expectedGeneration) {
-			panic("testsetup: the test ended before evaluation finished")
-		}
+		// Uninitialized; construct validates the active generation and installs
+		// the building state under the lifecycle lock.
 		return state
 	}
 	if state.generation != expectedGeneration {
@@ -312,6 +317,10 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 	m.buildMu.Lock()
 	defer m.buildMu.Unlock()
 
+	reset := func() {
+		m.state.Store(&letState[A]{status: letStatusInitial})
+	}
+
 	state = m.loadState(expectedGeneration)
 	switch state.status {
 	case letStatusBuilt:
@@ -320,16 +329,18 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 		FatalIfError(t, fmt.Errorf("Let failed to build"))
 		return state.value
 	case letStatusInitial:
-		building := &letState[A]{generation: expectedGeneration, status: letStatusBuilding}
-		if !m.state.CompareAndSwap(state, building) {
-			panic("testsetup: Let state changed while starting construction")
-		}
+		var building *letState[A]
+		registerLetReset(expectedGeneration, reset, func() {
+			building = &letState[A]{generation: expectedGeneration, status: letStatusBuilding}
+			m.state.Store(building)
+		})
 		state = building
+	default:
+		// Another caller installed the building state before us; its reset is
+		// already registered, but validate and record one for this generation
+		// as well in case cleanup is in flight.
+		registerLetReset(expectedGeneration, reset, func() {})
 	}
-
-	registerLetReset(func() {
-		m.state.Store(&letState[A]{status: letStatusInitial})
-	})
 
 	built := false
 	defer func() {
@@ -348,11 +359,6 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 	}
 	built = true
 	return value
-}
-
-func (m *letMetadata[A]) generationMatches(expectedGeneration uint64) bool {
-	ctx := currentCtx.Load()
-	return ctx != nil && ctx.t != nil && ctx.generation == expectedGeneration
 }
 
 // Let creates a LetWrapper that lazily loads the value when requested for

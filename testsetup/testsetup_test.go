@@ -356,15 +356,14 @@ func TestTestSetup(t *testing.T) {
 			assert.NotPanics(t, func() { m.loadState(123) })
 		})
 
-		t.Run("UninitializedStateAfterTestEndPanics", func(t *testing.T) {
+		t.Run("RegisterResetAfterTestEndPanics", func(t *testing.T) {
 			previous := currentCtx.Load()
 			currentCtx.Store(&testContext{t: t, generation: 2})
 			t.Cleanup(func() { currentCtx.Store(previous) })
 
-			m := &letMetadata[int]{}
-			m.state.Store(&letState[int]{status: letStatusInitial})
-
-			assert.Panics(t, func() { m.loadState(1) })
+			assert.Panics(t, func() {
+				registerLetReset(1, func() {}, func() {})
+			})
 		})
 
 		t.Run("MetadataWhenPassingUnexpectedValue", func(t *testing.T) {
