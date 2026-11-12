@@ -356,10 +356,23 @@ func TestTestSetup(t *testing.T) {
 			assert.NotPanics(t, func() { m.loadState(123) })
 		})
 
-		t.Run("BeginConstructionAfterTestEndPanics", func(t *testing.T) {
-			previous := currentCtx.Load()
+		t.Run("BeginConstructionWhenDisallowedReturnsFalse", func(t *testing.T) {
+			previous := constructionAllowed.Load()
+			constructionAllowed.Store(false)
+			t.Cleanup(func() { constructionAllowed.Store(previous) })
+
+			assert.False(t, beginLetConstruction(1, func() {}, func() {}))
+		})
+
+		t.Run("BeginConstructionGenerationMismatchPanics", func(t *testing.T) {
+			previousCtx := currentCtx.Load()
+			previousAllowed := constructionAllowed.Load()
 			currentCtx.Store(&testContext{t: t, generation: 2})
-			t.Cleanup(func() { currentCtx.Store(previous) })
+			constructionAllowed.Store(true)
+			t.Cleanup(func() {
+				currentCtx.Store(previousCtx)
+				constructionAllowed.Store(previousAllowed)
+			})
 
 			assert.Panics(t, func() {
 				beginLetConstruction(1, func() {}, func() {})

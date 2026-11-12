@@ -23,7 +23,7 @@ var (
 	currentCtx          atomic.Pointer[testContext]
 	generation          atomic.Uint64
 	constructionWG      sync.WaitGroup
-	constructionAllowed bool // guarded by mu
+	constructionAllowed atomic.Bool // guarded writes; lock-free reads
 	setupFuncs          []func(t *testing.T)
 	letResets           []func()
 )
@@ -107,7 +107,7 @@ func RunSetup(t *testing.T) {
 	}
 	generation.Add(1)
 	currentCtx.Store(&testContext{t: t, generation: generation.Load()})
-	constructionAllowed = true
+	constructionAllowed.Store(true)
 	letResets = nil
 	funcs := append([]func(*testing.T){}, setupFuncs...)
 	mu.Unlock()
@@ -121,7 +121,7 @@ func RunSetup(t *testing.T) {
 		// started. Do not hold mu while waiting: in-flight constructors may
 		// still be registering or unwinding.
 		mu.Lock()
-		constructionAllowed = false
+		constructionAllowed.Store(false)
 		mu.Unlock()
 		constructionWG.Wait()
 
@@ -166,16 +166,17 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 // install while still holding the lifecycle lock. Cleanup takes the same lock
 // to disallow new constructions and collect letResets, so construction either
 // starts before cleanup (and is waited for) or panics here.
-func beginLetConstruction(expectedGeneration uint64, reset func(), install func()) {
+func beginLetConstruction(expectedGeneration uint64, reset func(), install func()) bool {
 	mu.Lock()
 	defer mu.Unlock()
-	if !constructionAllowed {
-		panic("testsetup: the test ended before Let construction started")
+	if !constructionAllowed.Load() {
+		return false
 	}
 	validateGenerationLocked(expectedGeneration)
 	letResets = append(letResets, reset)
 	constructionWG.Add(1)
 	install()
+	return true
 }
 
 // endLetConstruction marks a beginLetConstruction as finished.
@@ -295,7 +296,7 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 		}
 
 		ctx := currentCtx.Load()
-		if ctx == nil || ctx.t == nil {
+		if ctx == nil || ctx.t == nil || !constructionAllowed.Load() {
 			definitionT.Helper()
 			// Note: we cannot call FatalIfError because definitionT
 			// is likely a parent test and we may be within a subtest.
@@ -360,10 +361,14 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 		return state.value
 	case letStatusInitial:
 		var building *letState[A]
-		beginLetConstruction(expectedGeneration, reset, func() {
+		if !beginLetConstruction(expectedGeneration, reset, func() {
 			building = &letState[A]{generation: expectedGeneration, status: letStatusBuilding}
 			m.state.Store(building)
-		})
+		}) {
+			errorfFuncHook.Apply(t.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
+			var zero A
+			return zero
+		}
 		defer endLetConstruction()
 		state = building
 	case letStatusBuilding:
@@ -395,15 +400,15 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 // Let creates a LetWrapper that lazily loads the value when requested for
 // by calling the provider constructor.
 //
-// A Let can only be evaluated after RunSetup starts and before the RunSetup
-// lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
+// A Let can only be evaluated while RunSetup is active. Calls before RunSetup
+// or once cleanup has begun fail the test with the same "Must call RunSetup"
+// error as a call before RunSetup.
 //
 // RunSetup cleanup stops new constructions and waits for constructions already
-// in flight before resetting cached values. An evaluation that starts
-// construction after cleanup begins panics. Cached reads are lock-free and may
-// still return the cached value while cleanup waits for in-flight construction.
-// Concurrent evaluation is supported. Recursive construction (a Let whose
-// constructor evaluates itself) deadlocks.
+// in flight before resetting cached values. Evaluations that observe cleanup in
+// progress fail the test; a cached read that already began before cleanup may
+// still complete. Concurrent evaluation is supported. Recursive construction
+// (a Let whose constructor evaluates itself) deadlocks.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{
