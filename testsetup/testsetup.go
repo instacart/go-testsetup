@@ -17,6 +17,7 @@ var (
 	tmpMetadataPointer any
 	currentT           *testing.T
 	setupFuncs         []func(t *testing.T)
+	letResets          []func()
 )
 
 var (
@@ -85,6 +86,10 @@ func AddSetup(t *testing.T, f func(t *testing.T)) {
 //
 // Setup callbacks must not call ModifyLet or ModifyLetValue; those helpers must
 // run before setup starts.
+//
+// A Let can only be evaluated after RunSetup starts and before its lifecycle
+// cleanup runs. Cached Let values are reset by that cleanup, after teardown
+// callbacks registered by setup functions or the test body.
 func RunSetup(t *testing.T) {
 	t.Helper()
 	mu.Lock()
@@ -93,13 +98,24 @@ func RunSetup(t *testing.T) {
 		FatalIfError(t, fmt.Errorf("RunSetup called twice or using parallel tests which is unsupported"))
 	}
 	currentT = t
+	letResets = nil
 	funcs := append([]func(*testing.T){}, setupFuncs...)
 	mu.Unlock()
 
+	// Register this before any setup callback. LIFO cleanup ordering then runs
+	// it after teardown callbacks registered by setup or by the test body, so
+	// teardowns still see the cached values. currentT is cleared here, so Lets
+	// cannot be used after this cleanup starts.
 	t.Cleanup(func() {
 		mu.Lock()
-		defer mu.Unlock()
+		resets := letResets
+		letResets = nil
 		currentT = nil
+		mu.Unlock()
+
+		for i := len(resets) - 1; i >= 0; i-- {
+			resets[i]()
+		}
 	})
 
 	// Run callbacks without holding mu: they may call public helpers that
@@ -122,6 +138,15 @@ type LetWrapper[A any] func() A
 func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 	AddSetup(t, func(t *testing.T) { l() })
 	return l
+}
+
+// registerLetReset records a reset for the active RunSetup lifecycle. The
+// lifecycle cleanup runs the resets after teardown callbacks registered by
+// setup or the test body.
+func registerLetReset(reset func()) {
+	mu.Lock()
+	defer mu.Unlock()
+	letResets = append(letResets, reset)
 }
 
 // ensureBeforeRunSetup fails the test when RunSetup has already started.
@@ -214,8 +239,10 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			return
 		}
 
+		mu.Lock()
 		t := currentT
-		if currentT == nil {
+		mu.Unlock()
+		if t == nil {
 			definitionT.Helper()
 			// Note: we cannot call FatalIfError because definitionT
 			// is likely a parent test and we may be within a subtest.
@@ -223,6 +250,9 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			// get really confused and the IDE error reporting sends you
 			// to random non existing files if you do that. So instead
 			// we just mark the failure and let the subtest continue.
+			//
+			// currentT is nil before RunSetup and after the RunSetup
+			// cleanup runs, so both cases are rejected here.
 			errorfFuncHook.Apply(definitionT.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
 			return
 		}
@@ -238,11 +268,13 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 				FatalIfError(t, fmt.Errorf("Failed to build Let, possible cycle!"))
 			} else if status == letStatusInitial {
 				if m.status.CompareAndSwap(letStatusInitial, letStatusBuilding) {
-					// Register cleanup as soon as the value is built. Doing it here,
-					// rather than from an AddSetup callback, means a Let built by an
-					// earlier setup callback is still reset if that callback skips or
-					// fails before reaching this Let's setup callback.
-					t.Cleanup(func() {
+					// Register the reset with the RunSetup lifecycle instead of
+					// t.Cleanup: a cleanup registered at build time can run before
+					// teardowns that were registered earlier, which would let a
+					// teardown rebuild and close a replacement. The lifecycle
+					// cleanup is registered before setup callbacks, so it runs after
+					// those teardowns.
+					registerLetReset(func() {
 						m.status.Store(letStatusInitial)
 						var zeroValue A
 						m.value = zeroValue
@@ -251,7 +283,7 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 						// Try setting status to failure
 						m.status.CompareAndSwap(letStatusBuilding, letStatusFailed)
 					}()
-					m.value = m.constructor(currentT)
+					m.value = m.constructor(t)
 					m.status.Store(letStatusBuilt)
 					break
 				}
@@ -263,6 +295,9 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 
 // Let creates a LetWrapper that lazily loads the value when requested for
 // by calling the provider constructor.
+//
+// A Let can only be evaluated after RunSetup starts and before the RunSetup
+// lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{

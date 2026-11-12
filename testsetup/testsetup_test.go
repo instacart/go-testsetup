@@ -259,6 +259,47 @@ func TestTestSetup(t *testing.T) {
 			})
 		})
 
+		t.Run("TeardownSeesCachedValueBeforeReset", func(t *testing.T) {
+			callCount := 0
+			a := Let(t, func(t *testing.T) *Sample {
+				callCount++
+				return &Sample{value: fmt.Sprintf("v%d", callCount)}
+			})
+			var closed string
+
+			t.Run("Run", func(t *testing.T) {
+				AddSetup(t, func(t *testing.T) {
+					// Registered before the Let is first evaluated: the
+					// lifecycle reset must run after this teardown.
+					t.Cleanup(func() {
+						closed = a().value
+					})
+				})
+				RunSetup(t)
+				assert.Equal(t, "v1", a().value)
+			})
+
+			assert.Equal(t, "v1", closed)
+			assert.Equal(t, 1, callCount)
+		})
+
+		t.Run("AfterRunSetupCleanupFails", func(t *testing.T) {
+			a := LetValue(t, 1)
+			errorMsgs := []string{}
+			errorfFuncHook.WithValue(func(format string, args ...any) {
+				errorMsgs = append(errorMsgs, fmt.Sprintf(format, args...))
+			}).SetupInTest(t)
+
+			t.Run("Run", func(t *testing.T) {
+				RunSetup(t)
+				assert.Equal(t, 1, a())
+			})
+
+			assert.Equal(t, 0, a())
+			assert.Len(t, errorMsgs, 1)
+			assert.Contains(t, errorMsgs[0], "Must call RunSetup before using Let")
+		})
+
 		t.Run("WhenAccessedBeforeRun", func(t *testing.T) {
 			a := LetValue(t, 1)
 

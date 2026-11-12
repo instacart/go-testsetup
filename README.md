@@ -92,6 +92,10 @@ Call `ModifyLet` (or `ModifyLetValue`) before `RunSetup` for the current test. O
 starts, values may already be built, so calling either from a setup function or after
 `RunSetup` fails the test instead of leaving a stale cached value.
 
+A `Let` can only be evaluated while `RunSetup` is active. Calls before `RunSetup` or after
+its cleanup fail the test. Teardowns registered by setup functions or the test body still
+see the cached value; the cache is reset after those teardowns run.
+
 Example from [example/example2_test.go](example/example2_test.go):
 
 ```go
