@@ -334,6 +334,28 @@ func TestTestSetup(t *testing.T) {
 			assert.Contains(t, errorMsgs[0], "Must call RunSetup before using Let")
 		})
 
+		t.Run("GenerationMismatchPanics", func(t *testing.T) {
+			previous := currentCtx.Load()
+			currentCtx.Store(&testContext{t: t, generation: 2})
+			t.Cleanup(func() { currentCtx.Store(previous) })
+
+			m := &letMetadata[int]{}
+			m.state.Store(&letState[int]{generation: 1, status: letStatusBuilt, value: 1})
+
+			assert.Panics(t, func() { m.loadState(2) })
+		})
+
+		t.Run("UninitializedStateAllowed", func(t *testing.T) {
+			previous := currentCtx.Load()
+			currentCtx.Store(&testContext{t: t, generation: 123})
+			t.Cleanup(func() { currentCtx.Store(previous) })
+
+			m := &letMetadata[int]{}
+			m.state.Store(&letState[int]{status: letStatusInitial})
+
+			assert.NotPanics(t, func() { m.loadState(123) })
+		})
+
 		t.Run("MetadataWhenPassingUnexpectedValue", func(t *testing.T) {
 			AssertFatalContains(t, func() {
 				LetWrapper[int](func() int { return 1 }).metadata(t)

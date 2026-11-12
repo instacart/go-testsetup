@@ -11,11 +11,17 @@ import (
 	"github.com/instacart/go-testhooks/testhooks"
 )
 
+type testContext struct {
+	t          *testing.T
+	generation uint64
+}
+
 var (
 	mu                 sync.Mutex
 	setMetadataPointer atomic.Bool
 	tmpMetadataPointer any
-	currentT           *testing.T
+	currentCtx         atomic.Pointer[testContext]
+	generation         atomic.Uint64
 	setupFuncs         []func(t *testing.T)
 	letResets          []func()
 )
@@ -71,7 +77,7 @@ func AddSetup(t *testing.T, f func(t *testing.T)) {
 	t.Helper()
 	mu.Lock()
 	defer mu.Unlock()
-	if currentT != nil {
+	if ctx := currentCtx.Load(); ctx != nil && ctx.t != nil {
 		FatalIfError(t, fmt.Errorf("AddSetup must be called before RunSetup"))
 	}
 	setupFuncs = append(setupFuncs, f)
@@ -93,24 +99,26 @@ func AddSetup(t *testing.T, f func(t *testing.T)) {
 func RunSetup(t *testing.T) {
 	t.Helper()
 	mu.Lock()
-	if currentT != nil {
+	if ctx := currentCtx.Load(); ctx != nil && ctx.t != nil {
 		mu.Unlock()
 		FatalIfError(t, fmt.Errorf("RunSetup called twice or using parallel tests which is unsupported"))
 	}
-	currentT = t
+	generation.Add(1)
+	currentCtx.Store(&testContext{t: t, generation: generation.Load()})
 	letResets = nil
 	funcs := append([]func(*testing.T){}, setupFuncs...)
 	mu.Unlock()
 
 	// Register this before any setup callback. LIFO cleanup ordering then runs
 	// it after teardown callbacks registered by setup or by the test body, so
-	// teardowns still see the cached values. currentT is cleared here, so Lets
-	// cannot be used after this cleanup starts.
+	// teardowns still see the cached values. The context is cleared here, so
+	// Lets cannot be used after this cleanup starts.
 	t.Cleanup(func() {
 		mu.Lock()
 		resets := letResets
 		letResets = nil
-		currentT = nil
+		generation.Add(1)
+		currentCtx.Store(nil)
 		mu.Unlock()
 
 		for i := len(resets) - 1; i >= 0; i-- {
@@ -153,7 +161,8 @@ func registerLetReset(reset func()) {
 func ensureBeforeRunSetup(t *testing.T, name string) {
 	t.Helper()
 	mu.Lock()
-	started := currentT != nil
+	ctx := currentCtx.Load()
+	started := ctx != nil && ctx.t != nil
 	mu.Unlock()
 	if started {
 		FatalIfError(t, fmt.Errorf("%s must be called before RunSetup", name))
@@ -223,8 +232,9 @@ const (
 )
 
 type letState[A any] struct {
-	status int32
-	value  A
+	generation uint64
+	status     int32
+	value      A
 }
 
 // letMetadata contains the state of a LetWrapper.
@@ -245,10 +255,8 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			return
 		}
 
-		mu.Lock()
-		t := currentT
-		mu.Unlock()
-		if t == nil {
+		ctx := currentCtx.Load()
+		if ctx == nil || ctx.t == nil {
 			definitionT.Helper()
 			// Note: we cannot call FatalIfError because definitionT
 			// is likely a parent test and we may be within a subtest.
@@ -257,46 +265,63 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 			// to random non existing files if you do that. So instead
 			// we just mark the failure and let the subtest continue.
 			//
-			// currentT is nil before RunSetup and after the RunSetup
+			// The context is nil before RunSetup and after the RunSetup
 			// cleanup runs, so both cases are rejected here.
 			errorfFuncHook.Apply(definitionT.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
 			return
 		}
+		t := ctx.t
 		t.Helper()
 
-		for {
-			state := m.state.Load()
-			switch state.status {
-			case letStatusBuilt:
-				return state.value
-			case letStatusFailed:
-				FatalIfError(t, fmt.Errorf("Let failed to build"))
-			case letStatusBuilding:
-				m.construct(t, state)
-			case letStatusInitial:
-				// If another goroutine wins this CAS, the next iteration
-				// reloads and either waits in construct or returns the value.
-				m.state.CompareAndSwap(state, &letState[A]{status: letStatusBuilding})
-			}
+		state := m.loadState(ctx.generation)
+		switch state.status {
+		case letStatusBuilt:
+			return state.value
+		case letStatusFailed:
+			FatalIfError(t, fmt.Errorf("Let failed to build"))
+			return state.value
+		default:
+			return m.construct(t, ctx.generation, state)
 		}
 	})
 }
 
-// construct builds the value for building. The build mutex serializes callers;
-// after acquiring it we re-check that this exact building state is still
-// current, so only one caller constructs and the rest observe the published
-// built/failed state.
-func (m *letMetadata[A]) construct(t *testing.T, building *letState[A]) {
+// loadState loads the current state and verifies that it belongs to the
+// expected RunSetup generation. An uninitialized state (generation zero) is
+// allowed; construct stamps it with the active generation.
+func (m *letMetadata[A]) loadState(expectedGeneration uint64) *letState[A] {
+	if !m.generationMatches(expectedGeneration) {
+		panic("testsetup: the test ended before evaluation finished")
+	}
+	state := m.state.Load()
+	if state.status == letStatusInitial && state.generation == 0 {
+		return state
+	}
+	if state.generation != expectedGeneration {
+		panic("testsetup: Let state belongs to a different RunSetup generation; the test ended before evaluation finished")
+	}
+	return state
+}
+
+// construct builds the value for state. buildMu serializes constructors; after
+// acquiring it we reload and re-check both the generation and the state.
+func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, state *letState[A]) A {
 	m.buildMu.Lock()
 	defer m.buildMu.Unlock()
 
-	current := m.state.Load()
-	if current != building {
-		if current.status == letStatusBuilt || current.status == letStatusFailed {
-			// Another goroutine finished while we were waiting.
-			return
+	state = m.loadState(expectedGeneration)
+	switch state.status {
+	case letStatusBuilt:
+		return state.value
+	case letStatusFailed:
+		FatalIfError(t, fmt.Errorf("Let failed to build"))
+		return state.value
+	case letStatusInitial:
+		building := &letState[A]{generation: expectedGeneration, status: letStatusBuilding}
+		if !m.state.CompareAndSwap(state, building) {
+			panic("testsetup: Let state changed while starting construction")
 		}
-		panic("testsetup: Let state changed while waiting to construct; worker goroutines must finish before the test ends")
+		state = building
 	}
 
 	registerLetReset(func() {
@@ -308,14 +333,29 @@ func (m *letMetadata[A]) construct(t *testing.T, building *letState[A]) {
 		if built {
 			return
 		}
-		m.state.CompareAndSwap(building, &letState[A]{status: letStatusFailed})
+		if m.generationMatches(expectedGeneration) {
+			m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusFailed})
+			return
+		}
+		// The test ended before construction finished. Do not leave a stale
+		// building state behind if cleanup did not get to reset it.
+		m.state.CompareAndSwap(state, &letState[A]{status: letStatusInitial})
 	}()
 
 	value := m.constructor(t)
-	built = true
-	if !m.state.CompareAndSwap(building, &letState[A]{status: letStatusBuilt, value: value}) {
-		panic("testsetup: Let was reset while constructing; worker goroutines must finish before the test ends")
+	if !m.generationMatches(expectedGeneration) {
+		panic("testsetup: the test ended before Let construction finished")
 	}
+	if !m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
+		panic("testsetup: Let state changed while constructing")
+	}
+	built = true
+	return value
+}
+
+func (m *letMetadata[A]) generationMatches(expectedGeneration uint64) bool {
+	ctx := currentCtx.Load()
+	return ctx != nil && ctx.t != nil && ctx.generation == expectedGeneration
 }
 
 // Let creates a LetWrapper that lazily loads the value when requested for
@@ -324,8 +364,10 @@ func (m *letMetadata[A]) construct(t *testing.T, building *letState[A]) {
 // A Let can only be evaluated after RunSetup starts and before the RunSetup
 // lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
 //
-// Concurrent evaluation is supported. Recursive construction (a Let whose
-// constructor evaluates itself) deadlocks.
+// Each evaluation is bound to the RunSetup generation it started in. If the
+// test ends before evaluation finishes, evaluation panics. Concurrent
+// evaluation is supported. Recursive construction (a Let whose constructor
+// evaluates itself) deadlocks.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{

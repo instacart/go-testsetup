@@ -96,8 +96,9 @@ A `Let` can only be evaluated while `RunSetup` is active. Calls before `RunSetup
 its cleanup fail the test. Teardowns registered by setup functions or the test body still
 see the cached value; the cache is reset after those teardowns run.
 
-Concurrent evaluation is supported. A `Let` whose constructor evaluates itself recursively
-deadlocks.
+Concurrent evaluation is supported. Each evaluation is bound to the `RunSetup` generation it
+started in; an evaluation that outlives its test panics. A `Let` whose constructor evaluates
+itself recursively deadlocks.
 
 Example from [example/example2_test.go](example/example2_test.go):
 
