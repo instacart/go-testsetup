@@ -290,11 +290,14 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 // expected RunSetup generation. An uninitialized state (generation zero) is
 // allowed; construct stamps it with the active generation.
 func (m *letMetadata[A]) loadState(expectedGeneration uint64) *letState[A] {
-	if !m.generationMatches(expectedGeneration) {
-		panic("testsetup: the test ended before evaluation finished")
-	}
 	state := m.state.Load()
 	if state.status == letStatusInitial && state.generation == 0 {
+		// An uninitialized state is not tied to a generation yet. Only allow
+		// claiming it while expectedGeneration is the active generation; a swap
+		// that reset it leaves it uninitialized for the next generation.
+		if !m.generationMatches(expectedGeneration) {
+			panic("testsetup: the test ended before evaluation finished")
+		}
 		return state
 	}
 	if state.generation != expectedGeneration {
@@ -333,21 +336,15 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 		if built {
 			return
 		}
-		if m.generationMatches(expectedGeneration) {
-			m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusFailed})
-			return
-		}
-		// The test ended before construction finished. Do not leave a stale
-		// building state behind if cleanup did not get to reset it.
-		m.state.CompareAndSwap(state, &letState[A]{status: letStatusInitial})
+		// If the test ended and cleanup reset the state, this CAS fails and
+		// the reset wins. Otherwise the failed state belongs to this
+		// generation and a later evaluation will detect the generation change.
+		m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusFailed})
 	}()
 
 	value := m.constructor(t)
-	if !m.generationMatches(expectedGeneration) {
-		panic("testsetup: the test ended before Let construction finished")
-	}
 	if !m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
-		panic("testsetup: Let state changed while constructing")
+		panic("testsetup: Let was reset while constructing")
 	}
 	built = true
 	return value
