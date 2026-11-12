@@ -17,15 +17,15 @@ type testContext struct {
 }
 
 var (
-	mu                 sync.Mutex
-	setMetadataPointer atomic.Bool
-	tmpMetadataPointer any
-	currentCtx         atomic.Pointer[testContext]
-	generation         atomic.Uint64
-	constructionWG     sync.WaitGroup
-	constructionClosed bool // guarded by mu
-	setupFuncs         []func(t *testing.T)
-	letResets          []func()
+	mu                  sync.Mutex
+	setMetadataPointer  atomic.Bool
+	tmpMetadataPointer  any
+	currentCtx          atomic.Pointer[testContext]
+	generation          atomic.Uint64
+	constructionWG      sync.WaitGroup
+	constructionAllowed bool // guarded by mu
+	setupFuncs          []func(t *testing.T)
+	letResets           []func()
 )
 
 var (
@@ -107,7 +107,7 @@ func RunSetup(t *testing.T) {
 	}
 	generation.Add(1)
 	currentCtx.Store(&testContext{t: t, generation: generation.Load()})
-	constructionClosed = false
+	constructionAllowed = true
 	letResets = nil
 	funcs := append([]func(*testing.T){}, setupFuncs...)
 	mu.Unlock()
@@ -118,10 +118,10 @@ func RunSetup(t *testing.T) {
 	// Lets cannot be used after this cleanup starts.
 	t.Cleanup(func() {
 		// Stop new constructions, then wait for any constructor that already
-		// started. Constructors publish under mu, so do not hold mu while
-		// waiting.
+		// started. Do not hold mu while waiting: in-flight constructors may
+		// still be registering or unwinding.
 		mu.Lock()
-		constructionClosed = true
+		constructionAllowed = false
 		mu.Unlock()
 		constructionWG.Wait()
 
@@ -164,12 +164,12 @@ func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
 // beginLetConstruction validates the active RunSetup generation, records the
 // reset for lifecycle cleanup, counts the construction as in flight, and runs
 // install while still holding the lifecycle lock. Cleanup takes the same lock
-// to close construction and collect letResets, so construction either starts
-// before cleanup (and is waited for) or panics here.
+// to disallow new constructions and collect letResets, so construction either
+// starts before cleanup (and is waited for) or panics here.
 func beginLetConstruction(expectedGeneration uint64, reset func(), install func()) {
 	mu.Lock()
 	defer mu.Unlock()
-	if constructionClosed {
+	if !constructionAllowed {
 		panic("testsetup: the test ended before Let construction started")
 	}
 	validateGenerationLocked(expectedGeneration)
@@ -385,26 +385,11 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 	}()
 
 	value := m.constructor(t)
-	m.publishBuilt(expectedGeneration, state, value)
+	if !m.state.CompareAndSwap(state, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
+		panic("testsetup: Let state changed while constructing")
+	}
 	built = true
 	return value
-}
-
-// publishBuilt validates the active generation and publishes the constructed
-// value, all while holding mu. Cleanup clears currentCtx and advances the
-// generation under the same lock before it resets individual Let states, so a
-// constructor that finishes after the lifecycle ended cannot publish: it panics
-// instead of returning a value from a completed test.
-//
-// Lock ordering is constructMu (held by construct) then mu. Cleanup takes mu but
-// never constructMu, so holding mu here cannot deadlock with cleanup.
-func (m *letMetadata[A]) publishBuilt(expectedGeneration uint64, building *letState[A], value A) {
-	mu.Lock()
-	defer mu.Unlock()
-	validateGenerationLocked(expectedGeneration)
-	if !m.state.CompareAndSwap(building, &letState[A]{generation: expectedGeneration, status: letStatusBuilt, value: value}) {
-		panic("testsetup: Let was reset while constructing")
-	}
 }
 
 // Let creates a LetWrapper that lazily loads the value when requested for
@@ -413,10 +398,12 @@ func (m *letMetadata[A]) publishBuilt(expectedGeneration uint64, building *letSt
 // A Let can only be evaluated after RunSetup starts and before the RunSetup
 // lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
 //
-// Each evaluation must finish before the RunSetup lifecycle cleanup runs: an
-// evaluation that outlives its test panics instead of returning a value, even
-// when its constructor already returned. Concurrent evaluation is supported.
-// Recursive construction (a Let whose constructor evaluates itself) deadlocks.
+// RunSetup cleanup stops new constructions and waits for constructions already
+// in flight before resetting cached values. An evaluation that starts
+// construction after cleanup begins panics. Cached reads are lock-free and may
+// still return the cached value while cleanup waits for in-flight construction.
+// Concurrent evaluation is supported. Recursive construction (a Let whose
+// constructor evaluates itself) deadlocks.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{
