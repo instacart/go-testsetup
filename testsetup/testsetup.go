@@ -1,0 +1,426 @@
+package testsetup
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/instacart/go-testhooks/testhooks"
+)
+
+type testContext struct {
+	t *testing.T
+}
+
+var (
+	mu                  sync.Mutex
+	setMetadataPointer  atomic.Bool
+	tmpMetadataPointer  any
+	currentCtx          atomic.Pointer[testContext]
+	constructionWG      sync.WaitGroup
+	constructionAllowed atomic.Bool // guarded writes; lock-free reads
+	setupFuncs          []func(t *testing.T)
+	letResets           []func()
+)
+
+var (
+	fatalfFuncHook = testhooks.NewValueHook[func(format string, args ...any)]()
+	errorfFuncHook = testhooks.NewValueHook[func(format string, args ...any)]()
+)
+
+// FatalIfError is a helper function that calls t.Fatalf if err is not nil.
+//
+// It also formats the error with "%+v" to include the stack traces.
+func FatalIfError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		fatalfFuncHook.Apply(t.Fatalf)("ERROR: %+v", err)
+	}
+}
+
+func FatalIfErrorElseReturn[T any](t *testing.T, err error, val T) T {
+	t.Helper()
+	FatalIfError(t, err)
+	return val
+}
+
+// AssertFatalContains is a helper to run a block of code with FatailIfError
+// being mocked to panic with the given message so we can actually assert on it.
+//
+// This is useful for testing test utilities.
+func AssertFatalContains(t *testing.T, f func(), contains string) {
+	t.Helper()
+	defer func() {
+		t.Helper()
+		if r := recover(); r != nil {
+			assert.Contains(t, r, contains)
+		}
+	}()
+	fatalfFuncHook.WithValue(func(format string, args ...any) {
+		t.Helper()
+		panic(fmt.Sprintf(format, args...))
+	}).RunFunc(f)
+	t.Errorf("Expected a panic")
+}
+
+// Add adds a setup function to the list of setup functions to be run when
+// `testsetup.RunSetup` is called.
+//
+// It must be called before `testsetup.RunSetup`.
+//
+// Functions added are removed after the current test finishes using `t.Cleanup`.
+// This ensures that setup functions added only affect the current test and its children.
+func AddSetup(t *testing.T, f func(t *testing.T)) {
+	t.Helper()
+	mu.Lock()
+	defer mu.Unlock()
+	if ctx := currentCtx.Load(); ctx != nil && ctx.t != nil {
+		FatalIfError(t, fmt.Errorf("AddSetup must be called before RunSetup"))
+	}
+	setupFuncs = append(setupFuncs, f)
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		setupFuncs = setupFuncs[:len(setupFuncs)-1]
+	})
+}
+
+// RunSetup runs setup functions added by `testsetup.AddSetup`.
+//
+// Setup callbacks must not call ModifyLet or ModifyLetValue; those helpers must
+// run before setup starts.
+//
+// A Let can only be evaluated after RunSetup starts and before its lifecycle
+// cleanup runs. Cached Let values are reset by that cleanup, after teardown
+// callbacks registered by setup functions or the test body.
+func RunSetup(t *testing.T) {
+	t.Helper()
+	mu.Lock()
+	if ctx := currentCtx.Load(); ctx != nil && ctx.t != nil {
+		mu.Unlock()
+		FatalIfError(t, fmt.Errorf("RunSetup called twice or using parallel tests which is unsupported"))
+	}
+	currentCtx.Store(&testContext{t: t})
+	constructionAllowed.Store(true)
+	letResets = nil
+	funcs := append([]func(*testing.T){}, setupFuncs...)
+	mu.Unlock()
+
+	// Register these before any setup callback. LIFO cleanup ordering makes the
+	// wait run first and the final reset run last, after teardowns registered by
+	// setup, the test body, or an in-flight constructor.
+	t.Cleanup(func() {
+		// Final reset. Registered first so it runs after the wait cleanup and
+		// any teardowns registered while that wait is in progress.
+		mu.Lock()
+		resets := letResets
+		letResets = nil
+		for i := len(resets) - 1; i >= 0; i-- {
+			resets[i]()
+		}
+		currentCtx.Store(nil)
+		mu.Unlock()
+	})
+	t.Cleanup(func() {
+		// Stop new evaluations, then wait for any evaluation that already
+		// started, including callers blocked on constructMu. Do not hold mu
+		// while waiting: in-flight evaluations may still be registering or
+		// unwinding.
+		mu.Lock()
+		constructionAllowed.Store(false)
+		mu.Unlock()
+		constructionWG.Wait()
+	})
+
+	// Run callbacks without holding mu: they may call public helpers that
+	// need it themselves.
+	for _, f := range funcs {
+		f(t)
+	}
+}
+
+// LetWrapper represents a value that is lazy loaded when requested for.
+//
+// See `testsetup.Let` and `testsetup.LetValue` for creating instances of `LetWrapper`.
+type LetWrapper[A any] func() A
+
+// Eager forces the value to be loaded eagerly for the current test.
+//
+// Shorthand for:
+//
+//	AddSetup(t, func(t *testing.T) { letWrapper() })
+func (l LetWrapper[A]) Eager(t *testing.T) LetWrapper[A] {
+	AddSetup(t, func(t *testing.T) { l() })
+	return l
+}
+
+// beginLetEvaluation validates the active RunSetup context and counts the
+// evaluation as in flight. It is called before constructMu so callers waiting
+// for another constructor are included in lifecycle draining. Cleanup takes
+// the same mu lock to disallow new evaluations and waits for them before reset.
+func beginLetEvaluation(expectedCtx *testContext) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if !constructionAllowed.Load() || currentCtx.Load() != expectedCtx {
+		return false
+	}
+	constructionWG.Add(1)
+	return true
+}
+
+// endLetEvaluation marks a beginLetEvaluation as finished.
+func endLetEvaluation() {
+	constructionWG.Done()
+}
+
+// registerLetReset records the reset and installs the building state for an
+// evaluation that has already begun. It runs under mu so cleanup cannot collect
+// the reset or reset the state between registration and installation.
+func registerLetReset(expectedCtx *testContext, reset func(), install func()) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if currentCtx.Load() != expectedCtx {
+		return false
+	}
+	letResets = append(letResets, reset)
+	install()
+	return true
+}
+
+// ensureBeforeRunSetup fails the test when RunSetup has already started.
+func ensureBeforeRunSetup(t *testing.T, name string) {
+	t.Helper()
+	mu.Lock()
+	ctx := currentCtx.Load()
+	started := ctx != nil && ctx.t != nil
+	mu.Unlock()
+	if started {
+		FatalIfError(t, fmt.Errorf("%s must be called before RunSetup", name))
+	}
+}
+
+// ModifyLet modifies the value of the LetWrapper for the current test.
+//
+// It receives a function that can access the previous constructor through the `super` function.
+//
+// It must be called before RunSetup. Once setup starts, Let values may already
+// be built, so calling ModifyLet (including from a setup function) fails the
+// test instead of silently keeping a stale cached value.
+func ModifyLet[A any](t *testing.T, l LetWrapper[A], f func(t *testing.T, super func() A) A) {
+	t.Helper()
+	ensureBeforeRunSetup(t, "ModifyLet")
+	modifyLet(t, l, f)
+}
+
+// ModifyLetValue is a variant of ModifyLet that uses a constant value.
+//
+// It must be called before RunSetup; see ModifyLet.
+func ModifyLetValue[A immutable](t *testing.T, l LetWrapper[A], a A) {
+	t.Helper()
+	ensureBeforeRunSetup(t, "ModifyLetValue")
+	modifyLet(t, l, func(t *testing.T, super func() A) A {
+		return a
+	})
+}
+
+func modifyLet[A any](t *testing.T, l LetWrapper[A], f func(t *testing.T, super func() A) A) {
+	t.Helper()
+	m := l.metadata(t)
+	previousConstructor := m.constructor
+	t.Cleanup(func() {
+		m.constructor = previousConstructor
+	})
+	m.constructor = func(t *testing.T) A {
+		return f(t, func() A { return previousConstructor(t) })
+	}
+}
+
+// metadata returns the letMetadata for the LetWrapper.
+//
+// Because golang functions are not comparable, this uses global
+// state to retrieve the metadata pointer.
+func (l LetWrapper[A]) metadata(t *testing.T) (res *letMetadata[A]) {
+	t.Helper()
+	mu.Lock()
+	defer mu.Unlock()
+	tmpMetadataPointer = &res
+	setMetadataPointer.Store(true)
+	defer func() { setMetadataPointer.Store(false) }()
+	l()
+	tmpMetadataPointer = nil
+	if res == nil {
+		FatalIfError(t, fmt.Errorf("Could not find metadata for Let!"))
+	}
+	return
+}
+
+const (
+	letStatusInitial = int32(iota)
+	letStatusBuilding
+	letStatusBuilt
+	letStatusFailed
+)
+
+type letState[A any] struct {
+	ctx    *testContext
+	status int32
+	value  A
+}
+
+// letMetadata contains the state of a LetWrapper.
+type letMetadata[A any] struct {
+	// definitionT *testing.T
+	constructor func(t *testing.T) A
+	state       atomic.Pointer[letState[A]]
+	constructMu sync.Mutex
+}
+
+// createWrapper creates a LetWrapper from the metadata.
+func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
+	definitionT.Helper()
+	m.state.Store(&letState[A]{status: letStatusInitial})
+	return LetWrapper[A](func() (res A) {
+		if setMetadataPointer.Load() {
+			*(tmpMetadataPointer.(**letMetadata[A])) = m
+			return
+		}
+
+		// A cached state is a complete snapshot: no separate lifecycle read is
+		// needed. If it was built for a context that has since ended, this read
+		// linearizes before the reset that replaced it.
+		state := m.state.Load()
+		switch state.status {
+		case letStatusBuilt:
+			return state.value
+		case letStatusFailed:
+			if state.ctx != nil && state.ctx.t != nil {
+				FatalIfError(state.ctx.t, fmt.Errorf("Let failed to build"))
+			} else {
+				errorfFuncHook.Apply(definitionT.Errorf)("ERROR: %v", fmt.Errorf("Let failed to build"))
+			}
+			return state.value
+		}
+
+		ctx := currentCtx.Load()
+		if ctx == nil || ctx.t == nil {
+			definitionT.Helper()
+			// Note: we cannot call FatalIfError because definitionT
+			// is likely a parent test and we may be within a subtest.
+			// Calling Fatal/FailNow methods causes the test framework to
+			// get really confused and the IDE error reporting sends you
+			// to random non existing files if you do that. So instead
+			// we just mark the failure and let the subtest continue.
+			//
+			// The context is nil before RunSetup and after the final cleanup,
+			// so both cases are rejected here.
+			errorfFuncHook.Apply(definitionT.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
+			return
+		}
+		t := ctx.t
+		t.Helper()
+
+		return m.construct(t, ctx, state)
+	})
+}
+
+// construct builds the value for state. The evaluation is counted before
+// constructMu so callers waiting for another constructor are drained by
+// cleanup too. constructMu serializes constructors; after acquiring it we
+// reload and re-check the state.
+func (m *letMetadata[A]) construct(t *testing.T, ctx *testContext, state *letState[A]) A {
+	if !beginLetEvaluation(ctx) {
+		errorfFuncHook.Apply(t.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
+		var zero A
+		return zero
+	}
+	defer endLetEvaluation()
+
+	m.constructMu.Lock()
+	defer m.constructMu.Unlock()
+
+	reset := func() {
+		m.state.Store(&letState[A]{status: letStatusInitial})
+	}
+
+	state = m.state.Load()
+	switch state.status {
+	case letStatusBuilt:
+		if state.ctx != ctx {
+			panic("testsetup: Let state belongs to a different RunSetup context")
+		}
+		return state.value
+	case letStatusFailed:
+		if state.ctx != ctx {
+			panic("testsetup: Let state belongs to a different RunSetup context")
+		}
+		FatalIfError(t, fmt.Errorf("Let failed to build"))
+		return state.value
+	case letStatusInitial:
+		var building *letState[A]
+		if !registerLetReset(ctx, reset, func() {
+			building = &letState[A]{ctx: ctx, status: letStatusBuilding}
+			m.state.Store(building)
+		}) {
+			errorfFuncHook.Apply(t.Errorf)("ERROR: %v", fmt.Errorf("Must call RunSetup before using Let"))
+			var zero A
+			return zero
+		}
+		state = building
+	case letStatusBuilding:
+		// constructMu serializes constructors: another constructor cannot still be
+		// building while we hold it. Seeing this state means an invariant was
+		// broken, not that we should build on another constructor's behalf.
+		panic("testsetup: Let is already building after acquiring the build lock")
+	}
+
+	built := false
+	defer func() {
+		if built {
+			return
+		}
+		// If cleanup reset the state, this CAS fails and the reset wins.
+		m.state.CompareAndSwap(state, &letState[A]{ctx: ctx, status: letStatusFailed})
+	}()
+
+	value := m.constructor(t)
+	if !m.state.CompareAndSwap(state, &letState[A]{ctx: ctx, status: letStatusBuilt, value: value}) {
+		panic("testsetup: Let state changed while constructing")
+	}
+	built = true
+	return value
+}
+
+// Let creates a LetWrapper that lazily loads the value when requested for
+// by calling the provider constructor.
+//
+// A Let can only be evaluated while RunSetup is active. Calls before RunSetup
+// or after the final cleanup fail the test with the same "Must call RunSetup"
+// error as a call before RunSetup.
+//
+// RunSetup cleanup stops new constructions and waits for constructions already
+// in flight before the final reset. Cached reads may complete while cleanup
+// waits; starting construction after cleanup begins fails. Concurrent
+// evaluation is supported. Recursive construction (a Let whose constructor
+// evaluates itself) deadlocks.
+func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
+	t.Helper()
+	return (&letMetadata[A]{
+		constructor: constructor,
+		// definitionT: t,
+	}).createWrapper(t)
+}
+
+// LetValue is a shorthand for Let that uses a constant value.
+func LetValue[A immutable](t *testing.T, x A) LetWrapper[A] {
+	t.Helper()
+	return Let(t, func(t *testing.T) A {
+		return x
+	})
+}
+
+type immutable interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr | ~float32 | ~float64 | ~string | ~bool
+}
