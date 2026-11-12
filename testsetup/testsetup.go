@@ -222,17 +222,23 @@ const (
 	letStatusFailed
 )
 
+type letState[A any] struct {
+	status int32
+	value  A
+}
+
 // letMetadata contains the state of a LetWrapper.
 type letMetadata[A any] struct {
 	// definitionT *testing.T
 	constructor func(t *testing.T) A
-	status      atomic.Int32
-	value       A
+	state       atomic.Pointer[letState[A]]
+	buildMu     sync.Mutex
 }
 
 // createWrapper creates a LetWrapper from the metadata.
 func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 	definitionT.Helper()
+	m.state.Store(&letState[A]{status: letStatusInitial})
 	return LetWrapper[A](func() (res A) {
 		if setMetadataPointer.Load() {
 			*(tmpMetadataPointer.(**letMetadata[A])) = m
@@ -259,43 +265,57 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 		t.Helper()
 
 		for {
-			// Reload on every iteration: another goroutine may have won the
-			// compare-and-swap or finished building while we were waiting.
-			status := m.status.Load()
-			if status == letStatusBuilt {
-				break
-			} else if status == letStatusFailed {
+			state := m.state.Load()
+			switch state.status {
+			case letStatusBuilt:
+				return state.value
+			case letStatusFailed:
 				FatalIfError(t, fmt.Errorf("Let failed to build"))
-			} else if status == letStatusBuilding {
-				// Recursive construction and concurrent evaluation cannot be
-				// distinguished without goroutine identity. Both are unsupported;
-				// fail instead of waiting (which would deadlock on a cycle).
-				FatalIfError(t, fmt.Errorf("Failed to build Let, possible cycle! Concurrent evaluation from multiple goroutines is also unsupported."))
-			} else if status == letStatusInitial {
-				if m.status.CompareAndSwap(letStatusInitial, letStatusBuilding) {
-					// Register the reset with the RunSetup lifecycle instead of
-					// t.Cleanup: a cleanup registered at build time can run before
-					// teardowns that were registered earlier, which would let a
-					// teardown rebuild and close a replacement. The lifecycle
-					// cleanup is registered before setup callbacks, so it runs after
-					// those teardowns.
-					registerLetReset(func() {
-						m.status.Store(letStatusInitial)
-						var zeroValue A
-						m.value = zeroValue
-					})
-					defer func() {
-						// Try setting status to failure
-						m.status.CompareAndSwap(letStatusBuilding, letStatusFailed)
-					}()
-					m.value = m.constructor(t)
-					m.status.Store(letStatusBuilt)
-					break
-				}
+			case letStatusBuilding:
+				m.construct(t, state)
+			case letStatusInitial:
+				// If another goroutine wins this CAS, the next iteration
+				// reloads and either waits in construct or returns the value.
+				m.state.CompareAndSwap(state, &letState[A]{status: letStatusBuilding})
 			}
 		}
-		return m.value
 	})
+}
+
+// construct builds the value for building. The build mutex serializes callers;
+// after acquiring it we re-check that this exact building state is still
+// current, so only one caller constructs and the rest observe the published
+// built/failed state.
+func (m *letMetadata[A]) construct(t *testing.T, building *letState[A]) {
+	m.buildMu.Lock()
+	defer m.buildMu.Unlock()
+
+	current := m.state.Load()
+	if current != building {
+		if current.status == letStatusBuilt || current.status == letStatusFailed {
+			// Another goroutine finished while we were waiting.
+			return
+		}
+		panic("testsetup: Let state changed while waiting to construct; worker goroutines must finish before the test ends")
+	}
+
+	registerLetReset(func() {
+		m.state.Store(&letState[A]{status: letStatusInitial})
+	})
+
+	built := false
+	defer func() {
+		if built {
+			return
+		}
+		m.state.CompareAndSwap(building, &letState[A]{status: letStatusFailed})
+	}()
+
+	value := m.constructor(t)
+	built = true
+	if !m.state.CompareAndSwap(building, &letState[A]{status: letStatusBuilt, value: value}) {
+		panic("testsetup: Let was reset while constructing; worker goroutines must finish before the test ends")
+	}
 }
 
 // Let creates a LetWrapper that lazily loads the value when requested for
@@ -304,9 +324,8 @@ func (m *letMetadata[A]) createWrapper(definitionT *testing.T) LetWrapper[A] {
 // A Let can only be evaluated after RunSetup starts and before the RunSetup
 // lifecycle cleanup runs. Calls before RunSetup or after that cleanup fail.
 //
-// Construction must happen on the goroutine that called RunSetup. Evaluate a
-// Let before starting worker goroutines; concurrent construction is unsupported
-// and fails the test.
+// Concurrent evaluation is supported. Recursive construction (a Let whose
+// constructor evaluates itself) deadlocks.
 func Let[A any](t *testing.T, constructor func(t *testing.T) A) LetWrapper[A] {
 	t.Helper()
 	return (&letMetadata[A]{

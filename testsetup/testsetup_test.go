@@ -3,7 +3,9 @@ package testsetup
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -148,15 +150,34 @@ func TestTestSetup(t *testing.T) {
 			}, "Let failed to build")
 		})
 
-		t.Run("OnCycle", func(t *testing.T) {
-			var a LetWrapper[*Sample]
-			a = Let(t, func(t *testing.T) *Sample { return a() })
-
+		t.Run("ConcurrentEvaluation", func(t *testing.T) {
+			callCount := 0
+			start := make(chan struct{})
+			a := Let(t, func(t *testing.T) *Sample {
+				<-start
+				time.Sleep(10 * time.Millisecond)
+				callCount++
+				return &Sample{value: "value"}
+			})
 			RunSetup(t)
 
-			AssertFatalContains(t, func() {
-				a()
-			}, "Failed to build Let, possible cycle!")
+			const workers = 8
+			results := make([]string, workers)
+			var wg sync.WaitGroup
+			for i := 0; i < workers; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					results[i] = a().value
+				}(i)
+			}
+			close(start)
+			wg.Wait()
+
+			for _, result := range results {
+				assert.Equal(t, "value", result)
+			}
+			assert.Equal(t, 1, callCount)
 		})
 
 		t.Run("MutationOnChildGetsRestored", func(t *testing.T) {
