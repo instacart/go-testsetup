@@ -335,11 +335,11 @@ func (m *letMetadata[A]) construct(t *testing.T, expectedGeneration uint64, stat
 			m.state.Store(building)
 		})
 		state = building
-	default:
-		// Another caller installed the building state before us; its reset is
-		// already registered, but validate and record one for this generation
-		// as well in case cleanup is in flight.
-		registerLetReset(expectedGeneration, reset, func() {})
+	case letStatusBuilding:
+		// buildMu serializes constructors: another constructor cannot still be
+		// building while we hold it. Seeing this state means an invariant was
+		// broken, not that we should build on another constructor's behalf.
+		panic("testsetup: Let is already building after acquiring the build lock")
 	}
 
 	built := false
